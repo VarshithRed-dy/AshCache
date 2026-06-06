@@ -17,21 +17,75 @@
 
 #include <chrono>
 
-struct Entry{
+struct Node{
+    std::string key;
     std::string value;
-    std::chrono::steady_clock::time_point expires_at; // if set key will expire after expires_at seconds.
-    bool has_expiry;
+
+    std::chrono::steady_clock::time_point expires_at;
+    bool has_expiry = false;
+
+    Node* prev = nullptr;
+    Node* next = nullptr;
 };
 
-std::unordered_map<std::string, Entry> store;
+std::unordered_map<std::string, Node*> lru_index; // lru_index[key] points to Node.
+
+Node* head = nullptr;
+Node* tail = nullptr;
+
+size_t max_size = 3;
+
 std::mutex store_mutex;
 
 std::queue<int> client_queue;
 std::mutex queue_mutex;
 std::condition_variable queue_cv;
 
-bool is_expired(const Entry& entry) {
-    return entry.has_expiry && std::chrono::steady_clock::now() > entry.expires_at;
+void init_lru(int capacity) {
+    max_size = capacity;
+    head = new Node();
+    tail = new Node();
+    head->next = tail;
+    tail->prev = head;
+}
+
+void add_after_head(Node* node) {
+    node->prev = head;
+    node->next = head->next;
+
+    head->next->prev = node;
+    head->next = node;
+}
+
+void remove_node(Node* node) {
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+
+    node->prev = nullptr;
+    node->next = nullptr;
+}
+
+void move_to_head(Node* node) {
+    remove_node(node);
+    add_after_head(node);
+}
+
+void delete_node(Node* node) {
+    remove_node(node);
+    lru_index.erase(node->key);
+    delete node;
+}
+
+void evict_tail() {
+    if(tail->prev == head){
+        return;
+    }
+    Node* lru = tail->prev;
+    delete_node(lru);
+}
+
+bool is_expired(const Node* node) {
+    return node->has_expiry && std::chrono::steady_clock::now() > node->expires_at;
 }
 
 std::string handle_command(std::string line){
@@ -50,49 +104,83 @@ std::string handle_command(std::string line){
         if (!value.empty() && value[0] == ' ') {
             value.erase(0, 1);
         }
-        
-        store[key] = Entry{value, std::chrono::steady_clock::time_point{}, false};
+        if(lru_index.find(key) != lru_index.end()){
+            Node* node = lru_index[key];
+            if(is_expired(node)){
+                delete_node(node);
+            }else{
+                node->value = value;
+                node->has_expiry = false;
+                move_to_head(node);
+                
+                return "+OK\n";
+            }
+        }
+        if(lru_index.size() >= max_size){
+            evict_tail();
+        }
+        Node* node = new Node();
+        node->key = key;
+        node->value = value;
+        node->has_expiry = false;
+
+        lru_index[key] = node;
+        add_after_head(node);
         return "+OK\n";
     }
     else if(command == "GET"){
-        if(store.find(key) != store.end()){
-            if(is_expired(store[key])){ // Lazy expiration, removed on next access
-                store.erase(key);
+        if(lru_index.find(key) != lru_index.end()){
+            if(is_expired(lru_index[key])){ // Lazy expiration, removed on next access
+                delete_node(lru_index[key]);
                 return "(nil)\n";
             }
-            return store[key].value + "\n";
+            move_to_head(lru_index[key]);
+            return lru_index[key]->value + "\n";
         }else return "(nil)\n";
     }
     else if(command == "DEL"){
-        return std::to_string(store.erase(key)) + "\n";
+        auto it = lru_index.find(key);
+        
+        if(it == lru_index.end()){
+            return "0\n";
+        }
+
+        delete_node(it->second);
+        return "1\n";
     }
     else if(command == "EXPIRE"){
         int seconds;
         iss >> seconds;
-        auto it = store.find(key);
-        if(it == store.end()){
+        auto it = lru_index.find(key);
+        if(it == lru_index.end()){
             return "0\n";
         }
         else if(is_expired(it->second)){ //it->second is the Entry object (store[key]).
-            store.erase(it);
+            delete_node(it->second);
             return "0\n";
         }
-        store[key].expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-        store[key].has_expiry = true;
+        it->second->expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        it->second->has_expiry = true;
         return "1\n";
     }
     else if(command == "TTL"){
-        auto it = store.find(key);
-        if(it == store.end()){
+        auto it = lru_index.find(key);
+        if(it == lru_index.end()){
             return "-2\n";
         }
-        if(!it->second.has_expiry){
+
+        if(is_expired(it->second)){
+            delete_node(it->second);
+            return "-2\n";
+        }
+
+        if(!it->second->has_expiry){
             return "-1\n";
         }
         auto now = std::chrono::steady_clock::now();
-        auto ttl = std::chrono::duration_cast<std::chrono::seconds>(it->second.expires_at - now);
+        auto ttl = std::chrono::duration_cast<std::chrono::seconds>(it->second->expires_at - now).count();
 
-        return std::to_string(ttl.count()) + "\n";
+        return std::to_string(ttl) + "\n";
     }
     return "-ERR unknown command\n";
 }
@@ -104,9 +192,11 @@ void expiry_loop() { // This creates a background thread that periodically check
         auto now = std::chrono::steady_clock::now();
         
         std::lock_guard<std::mutex> lock(store_mutex);
-        for(auto it = store.begin(); it != store.end(); ){
-            if(it->second.has_expiry && it->second.expires_at <= now){
-                it = store.erase(it);
+        for(auto it = lru_index.begin(); it != lru_index.end(); ){
+            if(is_expired(it->second)){
+                remove_node(it->second);
+                delete it->second;
+                it = lru_index.erase(it);
             }else{
                 ++it;
             }
@@ -147,12 +237,22 @@ void worker_loop() {
 }
 
 int main() {
+    init_lru(3);
+
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0); // AF_INET -> IPv4, SOCK_STREAM -> TCP, 0 -> default IPv4 + TCP protocol.
 
+    if(server_fd < 0){
+        perror("Failed to create socket");
+        return 1;
+    }
+
     // Set socket option
     int opt = 1; // Enable socket option
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // SO_REUSEADDR -> Allows reuse of local addresses
+    if(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0){ // SO_REUSEADDR -> Allows reuse of local addresses
+        perror("Failed to set socket option");
+        return 1;
+    }
 
 
     // Bind socket
@@ -161,8 +261,15 @@ int main() {
     address.sin_addr.s_addr = INADDR_ANY; // Listen on all available network interfaces
     address.sin_port = htons(6380); // Convert port number to network byte order(big -endian)
 
-    bind(server_fd, (sockaddr*)&address, sizeof(address));
-    listen(server_fd, 10); // 10 -> Maximum number of pending connections
+    if(bind(server_fd, (sockaddr*)&address, sizeof(address)) < 0){ // Bind socket to address
+        perror("Failed to bind socket");
+        return 1;
+    }
+
+    if(listen(server_fd, 10) < 0){ // 10 -> Maximum number of pending connections
+        perror("Failed to listen on socket");
+        return 1;
+    }
 
     std::cout<<"Listening on 6380...\n";
 
@@ -178,6 +285,10 @@ int main() {
 
     while(true){
         int client_fd = accept(server_fd, nullptr, nullptr);
+        if(client_fd < 0){
+            perror("Failed to accept connection");
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             client_queue.push(client_fd);
